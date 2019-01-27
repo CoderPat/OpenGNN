@@ -1,0 +1,28 @@
+# Example parameters (this does not cover every parameter)
+
+model_dir: model_dir
+
+data:
+  train_graphs_file: molecules_graphs_train.jsonl
+  train_labels_file: molecules_labels_train.jsonl
+
+  eval_graphs_file: molecules_graphs_valid.jsonl
+  eval_labels_file: molecules_labels_valid.jsonl
+
+  node_vocabulary: node.vocab
+  edge_vocabulary: edge.vocab
+
+  
+params:
+  learning_rate: 0.001
+  param_init: 0.1
+  clip_gradients: 1.
+  maximum_iterations: 250
+
+train:
+  batch_size: 64
+  bucket_width: 1
+  train_steps: 1000000
+  maximum_features_size: 200
+  maximum_labels_size: 50
+  sample_buffer_size: 10000

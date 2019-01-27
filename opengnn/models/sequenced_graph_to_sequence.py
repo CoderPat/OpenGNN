@@ -1,0 +1,274 @@
+from typing import Any, List, Dict, Tuple
+
+import tensorflow as tf
+
+import opengnn.constants as constants
+from opengnn.inputters.token_embedder import TokenEmbedder
+from opengnn.inputters.sequenced_graph_inputter import SequencedGraphInputter
+from opengnn.encoders.sequenced_graph_encoder import SequencedGraphEncoder
+from opengnn.inputters.graph_inputter import GraphInputter
+from opengnn.models.model import Model
+from opengnn.models.graph_to_sequence import shift_target_sequence, check_valid_copying_inputters
+from opengnn.utils.metrics import bleu_score, rouge_2_fscore, f1_score
+from opengnn.utils.misc import find
+from opengnn.utils.ops import batch_gather
+from opengnn.decoders.sequence.sequence_decoder import SequenceDecoder, get_sampling_probability
+from opengnn.decoders.sequence.hybrid_pointer_decoder import HybridPointerDecoder
+
+
+class SequencedGraphToSequence(Model):
+    def __init__(self,
+                 source_inputter: SequencedGraphInputter,
+                 target_inputter: TokenEmbedder,
+                 encoder: SequencedGraphEncoder,
+                 decoder: SequenceDecoder,
+                 name: str,
+                 metrics: Tuple[str] = ('BLEU', 'ROUGE'),
+                 only_attend_primary: bool = True):
+        super().__init__(name, source_inputter, target_inputter)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.metrics = metrics
+        self.labels_inputter.add_process_hooks([shift_target_sequence])
+        self.only_attend_primary = only_attend_primary
+        self.use_copying = isinstance(decoder, HybridPointerDecoder)
+        if self.use_copying:
+            check_valid_copying_inputters(source_inputter.graph_inputter, target_inputter)
+
+    def __call__(self,
+                 features: Dict[str, tf.Tensor],
+                 labels: Dict[str, tf.Tensor],
+                 mode: tf.estimator.ModeKeys,
+                 params: Dict[str, Any],
+                 config=None)-> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Args:
+            features: [description]
+            labels: [description]
+            mode: [description]
+            params: [description]
+            config: [description]
+        Returns:
+            outputs: raw outputs
+            predictions: predictions
+        """
+        adj_matrices = features["graph"]
+        node_features = features["features"]
+        graph_sizes = features["length"]
+        if self.use_copying:
+            # copying-specific data
+            out_ids = features["out_ids"]
+            pointer_maps = features["pointer_map"]
+        else:
+            out_ids = None
+            pointer_maps = None
+        primary_paths = features["primary_path"]
+        primary_path_lengths = features["primary_path_length"]
+        target_vocab_size = self.labels_inputter.vocabulary_size
+
+        # format input features (ex: embedding labels)
+        node_features = self.features_inputter.transform(
+            (node_features, graph_sizes), mode)
+
+        # build encoder using inputter metadata manually
+        # this is due to https://github.com/tensorflow/tensorflow/issues/15624
+        # and to the way estimators need to rebuild variables
+        self.encoder.build(
+            self.features_inputter.node_features_size,
+            self.features_inputter.num_edge_types,
+            mode=mode)
+
+        with tf.variable_scope("encoder"):
+            representations, initial_state = self.encoder(
+                adj_matrices=adj_matrices,
+                node_features=node_features,
+                graph_sizes=graph_sizes,
+                primary_paths=primary_paths,
+                primary_path_lengths=primary_path_lengths,
+                mode=mode)
+
+        # if only attenting over the primary sequence, we do extract only the representations
+        # of the nodes in it
+        if self.only_attend_primary:
+            representations = batch_gather(representations, primary_paths)
+            representation_lens = primary_path_lengths
+            if self.use_copying:
+                out_ids = batch_gather(out_ids, primary_paths)
+        else:
+            representation_lens = graph_sizes
+
+        # function for embeddings (needs scope to properly use embeddings variables)
+        def _target_embedding_fn(ids, scope):
+            try:
+                with tf.variable_scope(scope):
+                    return self.labels_inputter.transform((ids, None), mode)
+            except ValueError:
+                with tf.variable_scope(scope, reuse=True):
+                    return self.labels_inputter.transform((ids, None), mode)
+
+        logits, predictions, decoder_loss = None, None, None
+        # If we have labels, we can calculate the logits using teacher forcing (for loss, etc...)
+        if labels is not None:
+            decoder_input = labels["ids"]
+            output_len = labels["length"]
+
+            with tf.variable_scope("decoder") as scope:
+                decoder_emb_input = self.labels_inputter.transform((decoder_input, None), mode)
+
+                sampling_probability = get_sampling_probability(
+                    tf.train.get_or_create_global_step(),
+                    read_probability=params.get("scheduled_sampling_read_probability"),
+                    schedule_type=params.get("scheduled_sampling_type"),
+                    k=params.get("scheduled_sampling_k"))
+
+                _, logits, decoder_loss = self.decoder.decode(
+                    inputs=decoder_emb_input,
+                    sequence_length=output_len,
+                    vocab_size=target_vocab_size,
+                    initial_state=initial_state,
+                    sampling_probability=sampling_probability,
+                    embedding=lambda ids: _target_embedding_fn(ids, scope),
+                    memory=representations,
+                    memory_sequence_len=representation_lens,
+                    memory_out_ids=out_ids,
+                    mode=mode)
+
+        # If we are not training, we might need to decode
+        # using model predictions (for metrics, etc...)
+        if mode != tf.estimator.ModeKeys.TRAIN:
+            batch_size = tf.shape(representations)[0]
+            maximum_iterations = params.get("maximum_iterations", 250)
+
+            # If we also calculate logits using teacher forcing,
+            # we need to reuse variables for this decoder
+            with tf.variable_scope("decoder", reuse=labels is not None) as scope:
+                # generate start/end symbol for greedy decoder
+                start_tokens = tf.fill(
+                    [batch_size], constants.START_OF_SENTENCE_ID)
+                end_token = constants.END_OF_SENTENCE_ID
+
+                if params.get("beam_width", 1) <= 1:
+                    ids, log_probs = self.decoder.dynamic_decode(
+                        embedding=lambda ids: _target_embedding_fn(ids, scope),
+                        start_tokens=start_tokens,
+                        end_token=end_token,
+                        vocab_size=target_vocab_size,
+                        maximum_iterations=maximum_iterations,
+                        initial_state=initial_state,
+                        memory=representations,
+                        memory_sequence_len=representation_lens,
+                        memory_out_ids=out_ids,
+                        mode=mode)
+                else:
+                    ids, log_probs = self.decoder.dynamic_decode_and_search(
+                        embedding=lambda ids: _target_embedding_fn(ids, scope),
+                        start_tokens=start_tokens,
+                        end_token=end_token,
+                        vocab_size=target_vocab_size,
+                        maximum_iterations=maximum_iterations,
+                        initial_state=initial_state,
+                        beam_width=params.get("beam_width"),
+                        length_penalty=params.get("length_penalty", 0.0),
+                        memory=representations,
+                        memory_sequence_len=representation_lens,
+                        memory_out_ids=out_ids,
+                        mode=mode)
+
+            # Fetch tokens from normal vocab
+            rev_vocab = tf.contrib.lookup.index_to_string_table_from_file(
+                self.labels_inputter.vocabulary_file,
+                vocab_size=self.labels_inputter.vocabulary_size - 1,
+                default_value=constants.UNKNOWN_TOKEN)
+
+            target_tokens = rev_vocab.lookup(tf.cast(ids, tf.int64))
+
+            if self.use_copying:
+                # Fetch tokens from input sequence (non-pointer ids will get mapped to padding)
+                pointer_ids = ids - target_vocab_size + 1
+                pointer_ids = tf.clip_by_value(pointer_ids, 0, tf.reduce_max(pointer_ids))
+                batch_size = tf.shape(pointer_maps)[0]
+                padded_pointer_maps = tf.concat(
+                    [tf.fill((batch_size, 1), constants.PADDING_TOKEN), pointer_maps],
+                    axis=-1)
+                pointer_tokens = batch_gather(padded_pointer_maps, pointer_ids)
+
+                # Pick token from either normal vocab or input sequences depending on ids
+                target_tokens = tf.where(
+                    tf.greater_equal(ids, self.labels_inputter.vocabulary_size),
+                    pointer_tokens,
+                    target_tokens)
+
+            predictions = {
+                "tokens": target_tokens,
+                "ids": ids,
+                "log_probs": log_probs
+            }
+
+        return (logits, decoder_loss), predictions
+
+    def compute_loss(self, _, labels, outputs, params, mode: tf.estimator.ModeKeys)-> tf.Tensor:
+        # extract labels and batch info
+        label_ids = labels["ids_out"]
+        sequence_lens = labels["length"]
+
+        outputs, decoder_loss = outputs
+
+        batch_size = tf.shape(outputs)[0]
+        batch_max_len = tf.shape(outputs)[1]
+
+        loss_per_time = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=label_ids,
+            logits=outputs)
+
+        weights = tf.sequence_mask(
+            sequence_lens, maxlen=batch_max_len, dtype=tf.float32)
+
+        unnorm_loss = tf.reduce_sum(loss_per_time * weights)
+        total_timesteps = tf.reduce_sum(tf.cast(sequence_lens, tf.float32))
+
+        if decoder_loss is not None:
+            decoder_loss = tf.reduce_sum(decoder_loss * weights, axis=1) / \
+                tf.cast(sequence_lens, tf.float32)
+            decoder_loss = tf.reduce_sum(decoder_loss)
+
+            unnorm_loss = decoder_loss + unnorm_loss
+            tf.summary.scalar("decoder_loss", decoder_loss / total_timesteps)
+
+        if params.get("average_loss_in_time", False):
+            loss = unnorm_loss / total_timesteps
+            tb_loss = loss
+        else:
+            loss = unnorm_loss / tf.cast(batch_size, tf.float32)
+            tb_loss = unnorm_loss / total_timesteps
+
+        return loss, tb_loss
+
+    def compute_metrics(self, _, labels, predictions):
+        # extract labels and batch info
+        labels_ids = labels["ids_out"]
+        predictions_ids = predictions['ids']
+
+        eval_metric_ops = {}
+
+        if "BLEU" in self.metrics:
+            eval_metric_ops["bleu"] = bleu_score(
+                labels_ids, predictions_ids,
+                constants.END_OF_SENTENCE_ID)
+
+        if "ROUGE" in self.metrics:
+            eval_metric_ops["rouge"] = rouge_2_fscore(
+                labels_ids, predictions_ids,
+                constants.END_OF_SENTENCE_ID)
+
+        if "F1" in self.metrics:
+            eval_metric_ops["f1"] = f1_score(
+                labels_ids, predictions_ids,
+                constants.END_OF_SENTENCE_ID)
+
+        return eval_metric_ops
+
+    def process_prediction(self, prediction):
+        prediction_tokens = [token.decode('utf-8') for token in prediction['tokens']]
+        cropped_tokens = prediction_tokens[:find(
+            prediction_tokens, constants.END_OF_SENTENCE_TOKEN)]
+        return cropped_tokens

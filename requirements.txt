@@ -1,0 +1,3 @@
+docopt
+dpu_utils
+tensorflow>=1.10
