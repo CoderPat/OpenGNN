@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='OpenGNN',
-      version='0.1',
+      version='0.1.1',
       description='Open source machine learning for graph-structured data',
       author='Patrick Fernandes',
       author_email='pattuga@gmail.com',

@@ -1,4 +1,5 @@
 from typing import Tuple, Callable, Dict, Any
+from queue import Queue
 
 import numpy as np
 
@@ -15,17 +16,30 @@ def prune_nodes(node_labels, edges, backbone_sequence, truncated_sequence_size):
     backbone_nodes = set(truncated_backbone_sequence)
     removed_nodes = set(backbone_sequence[truncated_sequence_size:])
 
-    # check nodes that still connected to a backbone_sequence
-    connected = set()
+    fwd_edge_list = [[] for _ in range(len(node_labels))]
+    bwd_edge_list = [[] for _ in range(len(node_labels))]
     for edge in edges:
-        if edge[1] in backbone_nodes and \
-                edge[2] not in removed_nodes:
-            connected.add(edge[2])
-        if edge[2] in backbone_nodes and \
-                edge[1] not in removed_nodes:
-            connected.add(edge[1])
+        fwd_edge_list[edge[1]].append(edge)
+        bwd_edge_list[edge[2]].append(edge)
 
-    connected = connected | backbone_nodes
+    # check nodes that still connected to a backbone_sequence
+    # by doing a BFS
+    # TODO: this might prove too slow
+    connected = set()
+    queue = Queue()
+    for node in backbone_nodes:
+        queue.put(node)
+    while not queue.empty():
+        node = queue.get()
+        if node not in connected:
+            connected.add(node)
+            for edge in fwd_edge_list[node]:
+                if edge[2] not in connected and edge[2] not in removed_nodes:
+                    queue.put(edge[2])
+            for edge in bwd_edge_list[node]:
+                if edge[1] not in connected and edge[1] not in removed_nodes:
+                    queue.put(edge[1])
+
     offsets, truncated_node_labels = [], []
     j = 0
     for i in range(len(node_labels)):
@@ -37,7 +51,7 @@ def prune_nodes(node_labels, edges, backbone_sequence, truncated_sequence_size):
     truncated_edges = []
     for edge in edges:
         if edge[1] in connected and edge[2] in connected:
-            truncated_edges.append(edge)
+            truncated_edges.append((edge[0], offsets[edge[1]], offsets[edge[2]]))
 
     return truncated_node_labels, truncated_edges, truncated_backbone_sequence
 
