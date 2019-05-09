@@ -12,10 +12,9 @@ from opengnn.utils.misc import find_first, count_lines
 
 
 def prune_nodes(node_labels, edges, backbone_sequence, truncated_sequence_size):
-    truncated_backbone_sequence = backbone_sequence[:truncated_sequence_size]
-    backbone_nodes = set(truncated_backbone_sequence)
+    backbone_nodes = set(backbone_sequence[:truncated_sequence_size])
     removed_nodes = set(backbone_sequence[truncated_sequence_size:])
-
+    
     fwd_edge_list = [[] for _ in range(len(node_labels))]
     bwd_edge_list = [[] for _ in range(len(node_labels))]
     for edge in edges:
@@ -47,6 +46,10 @@ def prune_nodes(node_labels, edges, backbone_sequence, truncated_sequence_size):
         if i in connected:
             j += 1
             truncated_node_labels.append(node_labels[i])
+
+    truncated_backbone_sequence = []
+    for i in backbone_sequence[:truncated_sequence_size]:
+        truncated_backbone_sequence.append(offsets[i])
 
     truncated_edges = []
     for edge in edges:
